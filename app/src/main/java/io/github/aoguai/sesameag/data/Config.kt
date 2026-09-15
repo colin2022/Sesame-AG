@@ -203,6 +203,14 @@ class Config private constructor() {
         @JvmStatic
         fun isLegalAcceptedForCurrentVersion(): Boolean = INSTANCE.hasAcceptedLegalForCurrentVersion()
 
+        /** Raw persisted acceptance marker, for diagnostics only; acceptance needs it to equal [BuildConfig.VERSION_NAME]. */
+        @JvmStatic
+        fun legalAcceptedVersionRaw(): String? = INSTANCE.legalAcceptedAppVersion
+
+        /** Account whose config file is currently loaded, for diagnostics only. */
+        @JvmStatic
+        fun loadedUserIdRaw(): String? = INSTANCE.loadedUserId
+
         @JvmStatic
         fun setLegalAcceptedForCurrentVersion(accepted: Boolean) {
             INSTANCE.updateLegalAcceptedForCurrentVersion(accepted)

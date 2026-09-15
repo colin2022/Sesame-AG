@@ -838,6 +838,15 @@ class ApplicationHook {
         private const val FRIEND_CENTER_FIRST_SYNC_DEFER_MS: Long = 30_000L
         private val MIN_SUPPORTED_RPC_VERSION = AlipayVersion("10.3.96.8100")
 
+        /**
+         * The debug HTTP port is device-global, so a primary instance and a clone running in another
+         * Android user would otherwise contend for the same port.
+         */
+        private const val DEBUG_SERVER_BASE_PORT: Int = 8080
+
+        private fun debugServerPort(): Int =
+            DEBUG_SERVER_BASE_PORT + (RuntimeIdentityGuard.targetAndroidUserId() ?: 0).coerceIn(0, 999)
+
         private fun ensureRpcVersionSupported(): Boolean {
             val currentVersion = alipayVersion
             if (currentVersion.versionString.isBlank()) {
@@ -1290,7 +1299,7 @@ class ApplicationHook {
                 // 仅在用户开启“抓包调试模式”时启动调试 HTTP 服务（release 也可用）
                 try {
                     if (debugMode.value == true) {
-                        startIfNeeded(8080, "ET3vB^#td87sQqKaY*eMUJXP", processName, General.PACKAGE_NAME)
+                        startIfNeeded(debugServerPort(), "ET3vB^#td87sQqKaY*eMUJXP", processName, General.PACKAGE_NAME)
                     } else {
                         io.github.aoguai.sesameag.hook.server.ModuleHttpServerManager
                             .stop()
@@ -1526,6 +1535,22 @@ class ApplicationHook {
             val message = "必需权限或使用协议未就绪，已禁止工作流"
             record(TAG, "⛔ $message")
             Log.w(TAG, "execution_prerequisites_missing: legalAccepted=$legalAccepted account=${currentUid?.let(AccountSlotRegistry::shortHash) ?: "unknown"}")
+            // The marker is bound to one module version and lives in one account of one Android
+            // user, so a reinstall, an account switch and "never accepted" all report the same
+            // legalAccepted=false. Print what was actually read to keep them distinguishable.
+            val loadedUser = Config.loadedUserIdRaw()
+            val acceptedVersion = Config.legalAcceptedVersionRaw()?.trim().orEmpty()
+            val configFile =
+                loadedUser?.takeIf { it.isNotBlank() }
+                    ?.let { Files.getConfigV2File(it) }
+                    ?: Files.getDefaultConfigV2File()
+            record(
+                TAG,
+                "legal_gate_detail: androidUser=${RuntimeIdentityGuard.targetAndroidUserId()} " +
+                    "account=${loadedUser?.takeIf { it.isNotBlank() } ?: "<none>"} " +
+                    "file=${configFile.absolutePath} " +
+                    "found=${acceptedVersion.ifEmpty { "<empty>" }} expected=${BuildConfig.VERSION_NAME}",
+            )
             updateRunningStatus(message)
             ApplicationHookConstants.clearPendingTriggers("execution_prerequisites_missing")
             AccountSessionCoordinator.refreshWorkflowState(appContext, "execution_prerequisites_missing", legalAccepted = legalAccepted)
