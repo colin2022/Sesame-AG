@@ -56,6 +56,9 @@ object RuntimeIdentityGuard {
     @Volatile
     private var lastDecision = RuntimeIdentityDecision(false, "identity_not_verified")
 
+    @Volatile
+    private var moduleUidDetail: String? = null
+
     @Synchronized
     fun verifyModuleLoaded(applicationInfo: ApplicationInfo): RuntimeIdentityDecision {
         val packageName = applicationInfo.packageName.orEmpty()
@@ -125,6 +128,9 @@ object RuntimeIdentityGuard {
             val targetInfo = context.packageManager.getApplicationInfo(General.PACKAGE_NAME, 0)
             metadataStep = "query_module"
             val moduleInfo = context.packageManager.getApplicationInfo(General.MODULE_PACKAGE_NAME, 0)
+            moduleUidDetail =
+                "frameworkModuleUid=${module.uid} frameworkModuleUser=${androidUserId(module.uid)} " +
+                    "pmModuleUid=${moduleInfo.uid} pmModuleUser=${androidUserId(moduleInfo.uid)}"
             metadataStep = "compare_identity"
             when {
                 context.packageName != General.PACKAGE_NAME -> reject("target_context_package_mismatch")
@@ -133,7 +139,7 @@ object RuntimeIdentityGuard {
                 !matchesTargetIdentity(targetInfo, target) -> reject("target_package_manager_mismatch")
                 !matchesTargetSources(contextInfo, targetInfo, target) -> reject("target_source_mismatch")
                 moduleInfo.packageName != General.MODULE_PACKAGE_NAME -> reject("module_package_manager_mismatch")
-                moduleInfo.uid != module.uid -> reject("module_uid_mismatch")
+                moduleAppId(moduleInfo.uid) != moduleAppId(module.uid) -> reject("module_uid_mismatch")
                 moduleInfo.sourceDir.orEmpty() != module.sourceDir -> reject("module_source_mismatch")
                 else -> {
                     attachedIdentity = RuntimeIdentity(
@@ -175,6 +181,9 @@ object RuntimeIdentityGuard {
         targetSnapshot?.processName?.let(::isCaptureOnlyProcessName) == true
 
     fun lastReasonCode(): String? = lastDecision.reasonCode
+
+    /** Uid values compared at the most recent module identity check, for diagnostics. */
+    fun lastModuleUidDetail(): String? = moduleUidDetail
 
     fun trustedIdentity(): RuntimeIdentity? = attachedIdentity
 
@@ -218,6 +227,16 @@ object RuntimeIdentityGuard {
     /** UserHandle.getUserId is hidden from this module's compile SDK; Android reserves 100000 UIDs per user. */
     private fun androidUserId(uid: Int): Int =
         if (uid >= 0) uid / ANDROID_PER_USER_RANGE else -1
+
+    /**
+     * Application id without the Android user prefix.
+     *
+     * The framework reports the module's canonical uid (e.g. 10580) while a secondary user's
+     * PackageManager reports the user-scoped uid for the same install (e.g. 99910580), so the module
+     * identity check must compare app ids. Comparing raw uids only ever matched in the primary user.
+     */
+    private fun moduleAppId(uid: Int): Int =
+        if (uid >= 0) uid % ANDROID_PER_USER_RANGE else -1
 
     private fun accept(): RuntimeIdentityDecision = RuntimeIdentityDecision(true)
 

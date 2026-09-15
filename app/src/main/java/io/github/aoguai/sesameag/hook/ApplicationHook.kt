@@ -278,6 +278,11 @@ class ApplicationHook {
                     val message = "instance_rejected: $reasonCode process=$processName process_role=main"
                     logFrameworkWarning(message)
                     android.util.Log.w(TAG, message)
+                    RuntimeIdentityGuard.lastModuleUidDetail()?.let { detail ->
+                        val uidDetail = "identity_uid_detail: $detail reason=$reasonCode"
+                        logFrameworkWarning(uidDetail)
+                        android.util.Log.w(TAG, uidDetail)
+                    }
                     return@intercept result
                 }
                 XposedEnv.runtimeIdentity = RuntimeIdentityGuard.trustedIdentity()
