@@ -1484,16 +1484,10 @@ class ApplicationHook {
             record(TAG, "⏳ 正在检查执行权限，暂不启动工作流: $reason")
             execute {
                 try {
-                    val context = appContext ?: return@execute
-                    val executorStatus = CommandUtil.awaitServiceStatus(context)
-                    if (executorStatus is CommandUtil.ServiceStatus.Loading ||
-                        executorStatus is CommandUtil.ServiceStatus.Error
-                    ) {
-                        record(TAG, "⏳ 执行权限服务尚未就绪，保留待初始化状态: $reason")
-                        return@execute
-                    }
+                    // 命令服务只服务于界面探针与诊断读日志，业务任务全部走宿主 RPC。模块进程未启动时
+                    // 绑定服务会被系统拦截，所以这里只读取当前状态用于记录，不再等待或绑定执行器。
+                    val executorStatus = CommandUtil.serviceStatus.value
                     val granted = WorkflowRootGuard.hasRoot(forceRefresh = true, reason = reason) &&
-                        executorStatus is CommandUtil.ServiceStatus.Active &&
                         WorkflowRootGuard.isExecutionAllowed()
                     if (!granted) {
                         Log.w(TAG, "execution_prerequisites_missing: trigger=$reason executor=${executorStatus.javaClass.simpleName} " +
@@ -1502,6 +1496,9 @@ class ApplicationHook {
                         ApplicationHookConstants.clearPendingTriggers("root_denied")
                         AccountSessionCoordinator.refreshWorkflowState(appContext, "root_denied")
                         return@execute
+                    }
+                    if (!WorkflowRootGuard.isExecutorReady()) {
+                        record(TAG, "ℹ️ 命令服务未就绪（${executorStatus.javaClass.simpleName}），以降级模式继续: $reason")
                     }
 
                     ApplicationHookConstants.submitEntry("execution_permission_ready") {
