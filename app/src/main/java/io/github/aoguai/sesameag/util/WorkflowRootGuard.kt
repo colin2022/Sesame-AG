@@ -12,7 +12,10 @@ import kotlinx.coroutines.sync.withLock
  * 统一工作流执行权限门禁。
  *
  * `hasRoot/hasGrantedRoot` 表示“当前进程已由受支持的 libxposed 运行时注入或实时 Root 可用”。
- * 实际业务执行还必须通过 `isExecutionAllowed` 检查必需权限、协议和运行账号。
+ * `isExecutionAllowed` 只校验注入状态、运行账号与使用协议，不要求命令服务（Root/Shizuku 执行器）在线。
+ *
+ * 执行器只服务于界面探针与诊断读日志：业务任务全部通过宿主应用的 RPC 完成，不依赖 Shell。
+ * 因此执行器不可用时业务照常运行，仅依赖 Shell 的能力降级。
  */
 object WorkflowRootGuard {
     private const val TAG = "WorkflowRootGuard"
@@ -29,10 +32,31 @@ object WorkflowRootGuard {
     @Volatile
     private var lastLoggedState: Boolean? = null
 
+    @Volatile
+    private var lastLoggedExecutorState: Boolean? = null
+
     fun isExecutionAllowed(): Boolean {
         if (!RuntimeIdentityGuard.isTrustedForExecution() || resolveHookAccessSource() == null) return false
         val userId = UserMap.currentUid?.trim()?.takeIf { it.isNotEmpty() } ?: return false
-        return AccountSlotRegistry.isExecutableUser(userId) && CommandUtil.isExecutionAllowed(userId)
+        logExecutorState()
+        return AccountSlotRegistry.isExecutableUser(userId)
+    }
+
+    /** 命令服务是否已就绪。业务不再依赖它，仅供需要 Shell 的功能与诊断参考。 */
+    fun isExecutorReady(): Boolean =
+        CommandUtil.serviceStatus.value is CommandUtil.ServiceStatus.Active
+
+    private fun logExecutorState() {
+        val ready = isExecutorReady()
+        if (lastLoggedExecutorState == ready) {
+            return
+        }
+        lastLoggedExecutorState = ready
+        if (ready) {
+            Log.record(TAG, "✅ 命令服务已就绪，需要 Shell 的功能可正常使用")
+        } else {
+            Log.record(TAG, "ℹ️ 命令服务未就绪，本次以降级模式运行（业务任务不受影响，依赖 Shell 的功能不可用）")
+        }
     }
 
     fun hasGrantedRoot(): Boolean = resolveHookAccessSource() != null || lastGranted
