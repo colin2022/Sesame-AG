@@ -1,0 +1,328 @@
+name: Manual Build
+run-name: Manual Build - ${{ inputs.ref }} (${{ inputs.build_type }}, arm64-v8a)
+
+# 手动构建工作流：在 Actions 页面点 "Run workflow" 触发，**不做 push 自动构建**。
+#
+# 四个前置约定：
+#   1. `workflow_dispatch` 的按钮只在**默认分支**上存在本文件时才出现。本仓库默认分支是
+#      `fix/app-clone-multiuser`（补丁分支），本文件随它一起提交，所以按钮常驻可用；
+#      `main`/`dev` 保持上游镜像，对它们 Sync fork 不影响这里。
+#   2. 构建需要完整 git 历史：versionCode 由 `git rev-list --count HEAD` 计算，浅克隆
+#      会让它退化成 1。因此 checkout 使用 fetch-depth: 0。
+#   3. 产物只保留 arm64-v8a：构建脚本完全不动，在打包阶段丢弃其它 ABI 与 universal 包
+#      （原因见 "Stage And Verify APK" 上方的说明）。
+#   4. 默认 `release`（常规包，产物名 Sesame-AG-<版本>-vc<码>-arm64-v8a.apk）；`debug` 仅在
+#      需要时选，产物名带 `-debug` 后缀。两者 versionName 不同（debug 带 `-debug` 后缀），
+#      而使用协议标记与 BuildConfig.VERSION_NAME 强绑定，所以两种包互相覆盖安装后都要重新
+#      确认协议。
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: 要构建的分支 / 标签 / 提交
+        required: true
+        default: fix/app-clone-multiuser
+        type: string
+      build_type:
+        description: 构建类型（两者都用 debug 签名配置，可直接安装）
+        required: true
+        default: release
+        type: choice
+        options:
+          - release
+          - debug
+
+env:
+  CI: "true"
+  JAVA_DISTRIBUTION: "oracle"
+  JAVA_VERSION: "17.0.1"
+  ANDROID_API_LEVEL: "37"
+  ANDROID_PLATFORM: "android-37.0"
+  ANDROID_BUILD_TOOLS: "37.0.0"
+  TARGET_ABI: "arm64-v8a"
+  DEFAULT_BUILD_TYPE: release
+  STAGING_DIR: app/build/outputs/apk/manual
+
+concurrency:
+  group: manual-build-${{ inputs.ref }}-${{ inputs.build_type }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          ref: ${{ inputs.ref || github.ref }}
+
+      - name: Resolve Build Parameters
+        id: params
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          # 统一取值并校验，后续步骤只认这两个 output。手动触发的 inputs 一定有值，这里的
+          # 回落分支只是让流程在缺值时也稳定（例如将来再加别的触发方式）。
+          build_type="${{ inputs.build_type }}"
+          if [[ -z "${build_type}" ]]; then
+            build_type="${DEFAULT_BUILD_TYPE}"
+          fi
+          if [[ "${build_type}" != "debug" && "${build_type}" != "release" ]]; then
+            echo "::error::未知的构建类型: ${build_type}" >&2
+            exit 1
+          fi
+
+          build_ref="${{ inputs.ref }}"
+          if [[ -z "${build_ref}" ]]; then
+            build_ref="${{ github.ref }}"
+          fi
+
+          echo "build_type=${build_type}" >> "$GITHUB_OUTPUT"
+          echo "build_ref=${build_ref}" >> "$GITHUB_OUTPUT"
+          echo "本次构建: ref=${build_ref} type=${build_type}"
+
+      - name: Resolve Version Metadata
+        id: meta
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          version_name="$(sed -n 's/^appVersion=//p' gradle.properties | head -n1 | tr -d '\r')"
+          if [[ -z "${version_name}" ]]; then
+            echo "无法从 gradle.properties 解析 appVersion" >&2
+            exit 1
+          fi
+
+          version_code="$(git rev-list --count HEAD | tr -d '\n')"
+          if [[ -z "${version_code}" ]]; then
+            echo "无法通过 git 历史解析 versionCode" >&2
+            exit 1
+          fi
+
+          echo "version_name=${version_name}" >> "$GITHUB_OUTPUT"
+          echo "version_code=${version_code}" >> "$GITHUB_OUTPUT"
+          echo "short_sha=$(git rev-parse --short HEAD)" >> "$GITHUB_OUTPUT"
+          echo "commit_subject=$(git log -1 --format=%s)" >> "$GITHUB_OUTPUT"
+
+      - name: Verify Local Fixes Present
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          guard="app/src/main/java/io/github/aoguai/sesameag/hook/RuntimeIdentityGuard.kt"
+          hook="app/src/main/java/io/github/aoguai/sesameag/hook/ApplicationHook.kt"
+          gate="app/src/main/java/io/github/aoguai/sesameag/util/WorkflowRootGuard.kt"
+
+          if grep -q 'PRIMARY_ANDROID_USER_ID' "${guard}"; then
+            echo "::error::${guard} 仍包含 PRIMARY_ANDROID_USER_ID，所构建的 ref 不含应用分身修复"
+            exit 1
+          fi
+          if ! grep -q 'targetAndroidUserId' "${guard}"; then
+            echo "::error::${guard} 缺少 targetAndroidUserId()，应用分身修复不完整"
+            exit 1
+          fi
+          if ! grep -q 'moduleAppId' "${guard}"; then
+            echo "::error::${guard} 缺少 moduleAppId()，分身下的模块 uid 校验会失败"
+            exit 1
+          fi
+          if ! grep -q 'debugServerPort' "${hook}"; then
+            echo "::error::${hook} 缺少按 Android 用户偏移的调试端口，修复不完整"
+            exit 1
+          fi
+
+          # 执行权限软依赖：命令服务只是探针与诊断在用，业务任务走宿主 RPC，不应作为启动前
+          # 置条件——模块进程未启动时绑定会被系统拦截，工作流会永久停在待初始化状态。
+          if ! grep -q 'isExecutorReady' "${gate}"; then
+            echo "::error::${gate} 缺少 isExecutorReady()，执行权限软依赖补丁未应用"
+            exit 1
+          fi
+          if grep -q 'awaitServiceStatus' "${hook}"; then
+            echo "::error::${hook} 仍在等待命令服务，执行权限仍是硬门禁；未先启动模块 App 时工作流不会运行"
+            exit 1
+          fi
+
+          echo "已确认所构建的 ref 包含应用分身修复与执行权限软依赖"
+
+      # 这里刻意不修改 app/build.gradle.kts —— 不要"优化"回去。
+      #
+      # 曾两次尝试把 ABI 收窄写进构建脚本（splits.abi.include → arm64-v8a），两次构建都失败：
+      #   Conflicting configuration : '...' in ndk abiFilters cannot be present when
+      #   splits abi filters are set : arm64-v8a
+      # 原因是 CI 下 app/build.gradle.kts 会执行 ndk { abiFilters.addAll(全量 4 个 ABI) }
+      # （isCIBuild 分支），只要 splits.abi.include 被收窄，AGP 就报这个冲突；把 abiFilters
+      # 一起收窄同样报错。已验证可用的组合只有"两者都保持全量"（运行 #1 成功产出 5 个 APK）。
+      #
+      # 所以构建脚本一字不改：Gradle 仍然构建全部 4 个 ABI 与 universal 包，ABI 在打包阶段
+      # 筛选，只保留 app-arm64-v8a-<type>.apk。代价是构建时间与之前那次成功的运行相同。
+      - name: Set up JDK
+        uses: actions/setup-java@v5
+        with:
+          distribution: ${{ env.JAVA_DISTRIBUTION }}
+          java-version: ${{ env.JAVA_VERSION }}
+          architecture: x64
+          check-latest: false
+          cache: gradle
+
+      - name: Pin Gradle Java Home
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "ORG_GRADLE_JAVA_HOME=${JAVA_HOME}" >> "$GITHUB_ENV"
+
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@v3
+        with:
+          packages: ""
+
+      - name: Install Required Android SDK Packages
+        shell: bash
+        run: |
+          set -euo pipefail
+          sdkmanager --install \
+            "platform-tools" \
+            "platforms;${ANDROID_PLATFORM}" \
+            "build-tools;${ANDROID_BUILD_TOOLS}"
+          # `yes` 会在 sdkmanager 读完输入后收到 SIGPIPE，
+          # 这里临时关掉 pipefail，让该步骤反映 sdkmanager 的退出码。
+          set +o pipefail
+          yes | sdkmanager --licenses >/dev/null
+          set -o pipefail
+
+      - name: Set up Gradle
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          cache-read-only: false
+          gradle-version: wrapper
+
+      - name: Grant Execute Permission For gradlew
+        run: chmod +x gradlew
+
+      - name: Print Toolchain Versions
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "JAVA_HOME=${JAVA_HOME}"
+          echo "ANDROID_HOME=${ANDROID_HOME:-}"
+          java -version
+          ./gradlew --version
+
+      - name: Build APKs
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ "${{ steps.params.outputs.build_type }}" == "debug" ]]; then
+            task="assembleDebug"
+          else
+            task="assembleRelease"
+          fi
+          echo "运行 ./gradlew ${task}（构建全部 ABI，产物阶段只保留 ${TARGET_ABI}）"
+          ./gradlew --no-daemon --stacktrace "${task}"
+
+      - name: Stage And Verify APK
+        id: stage
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          build_type="${{ steps.params.outputs.build_type }}"
+          version_name="${{ steps.meta.outputs.version_name }}"
+          version_code="${{ steps.meta.outputs.version_code }}"
+          src="app/build/outputs/apk/${build_type}"
+
+          rm -rf "${STAGING_DIR}"
+          mkdir -p "${STAGING_DIR}"
+
+          mapfile -t apks < <(find "${src}" -maxdepth 1 -type f -name '*.apk' | sort)
+          if [[ ${#apks[@]} -eq 0 ]]; then
+            echo "未在 ${src} 找到任何 APK" >&2
+            exit 1
+          fi
+          printf '本次构建产出 APK (%d):\n' "${#apks[@]}"
+          printf '  %s\n' "${apks[@]#*/}"
+
+          # 构建脚本产出 4 个 ABI 分包 + universal 包，这里只取 arm64-v8a 那一个，
+          # 其余全部丢弃——所以下载到的产物只有 arm64-v8a。
+          abi_apk=""
+          for apk in "${apks[@]}"; do
+            if [[ "$(basename "${apk}")" == "app-${TARGET_ABI}-${build_type}.apk" ]]; then
+              abi_apk="${apk}"
+              break
+            fi
+          done
+          if [[ -z "${abi_apk}" ]]; then
+            echo "::error::未找到 app-${TARGET_ABI}-${build_type}.apk，产出结构可能已变动" >&2
+            exit 1
+          fi
+
+          # 解包检查 native 库目录，比读 badging 更贴近实际载荷：确认这个分包里只有 arm64-v8a。
+          mapfile -t abis < <(unzip -Z1 "${abi_apk}" 'lib/*' 2>/dev/null | awk -F/ '{print $2}' | sort -u)
+          printf '%s 内 native 库 ABI: %s\n' "$(basename "${abi_apk}")" "${abis[*]:-<无>}"
+          if [[ ${#abis[@]} -ne 1 || "${abis[0]}" != "${TARGET_ABI}" ]]; then
+            echo "::error::包内 ABI 不是唯一的 ${TARGET_ABI}（实际: ${abis[*]:-<无>}）" >&2
+            exit 1
+          fi
+
+          # 常规产物名形如 Sesame-AG-0.2.3-vc4282-arm64-v8a.apk；只有 debug 构建才带后缀，
+          # 以免两种包名字撞车。
+          apk_name="Sesame-AG-${version_name}-vc${version_code}-${TARGET_ABI}"
+          if [[ "${build_type}" == "debug" ]]; then
+            apk_name="${apk_name}-debug"
+          fi
+          apk_name="${apk_name}.apk"
+          cp "${abi_apk}" "${STAGING_DIR}/${apk_name}"
+
+          echo "apk_path=${STAGING_DIR}/${apk_name}" >> "$GITHUB_OUTPUT"
+          echo "apk_name=${apk_name}" >> "$GITHUB_OUTPUT"
+          echo "apk_size=$(du -h "${STAGING_DIR}/${apk_name}" | cut -f1)" >> "$GITHUB_OUTPUT"
+          ls -l "${STAGING_DIR}"
+
+      - name: Upload APK
+        id: upload_apk
+        uses: actions/upload-artifact@v7
+        with:
+          # archive 为 false 时 artifact 名取自文件名，下载得到的直接就是 APK。
+          name: apk
+          path: ${{ steps.stage.outputs.apk_path }}
+          archive: false
+          if-no-files-found: error
+          retention-days: 30
+          overwrite: true
+
+      - name: Write Job Summary
+        if: always()
+        shell: bash
+        env:
+          BUILD_REF: ${{ steps.params.outputs.build_ref }}
+          BUILD_TYPE: ${{ steps.params.outputs.build_type }}
+          VERSION_NAME: ${{ steps.meta.outputs.version_name }}
+          VERSION_CODE: ${{ steps.meta.outputs.version_code }}
+          SHORT_SHA: ${{ steps.meta.outputs.short_sha }}
+          COMMIT_SUBJECT: ${{ steps.meta.outputs.commit_subject }}
+          APK_NAME: ${{ steps.stage.outputs.apk_name }}
+          APK_SIZE: ${{ steps.stage.outputs.apk_size }}
+          APK_DIGEST: ${{ steps.upload_apk.outputs.artifact-digest }}
+        run: |
+          set -euo pipefail
+          {
+            echo "## Manual Build"
+            echo
+            echo "- 构建 ref: \`${BUILD_REF}\`"
+            echo "- 构建类型: \`${BUILD_TYPE}\`"
+            echo "- 目标 ABI: \`${TARGET_ABI}\`（产物中仅此一个）"
+            echo "- 提交: \`${SHORT_SHA}\` — ${COMMIT_SUBJECT}"
+            echo "- versionName: \`${VERSION_NAME}\`"
+            echo "- versionCode: \`${VERSION_CODE}\`"
+            echo "- APK: \`${APK_NAME}\` (${APK_SIZE})"
+            echo "- SHA-256: \`${APK_DIGEST:-未获取}\`"
+            echo
+            echo "产物在本页 Artifacts 区域，\`${APK_NAME:-<见上>}\` 可直接下载安装。"
+            echo
+            echo "> 该产物使用 debug 签名配置签名。设备上若已安装官方签名版本，必须先卸载才能安装。"
+          } >> "$GITHUB_STEP_SUMMARY"

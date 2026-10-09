@@ -10,8 +10,9 @@ import java.nio.charset.StandardCharsets
 
 class ModuleHttpServer(
     port: Int = 8080,
-    secretToken: String = ""
-) : NanoHTTPD("0.0.0.0", port) {
+    secretToken: String = "",
+    host: String = LOOPBACK_HOST,
+) : NanoHTTPD(host, port) {
     private val tag = "ModuleHttpServer"
 
     private val routes = mutableMapOf<String, HttpHandler>()
@@ -72,6 +73,11 @@ class ModuleHttpServer(
 
     private fun notFound(): Response {
         return newFixedLengthResponse(Response.Status.NOT_FOUND, ServerCommon.MIME_PLAINTEXT, "Not Found")
+    }
+
+    companion object {
+        /** Debug traffic stays on this device; binding 0.0.0.0 exposed it to the whole LAN. */
+        const val LOOPBACK_HOST: String = "127.0.0.1"
     }
 }
 

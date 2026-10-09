@@ -7,7 +7,13 @@ import io.github.aoguai.sesameag.data.General
 import java.io.File
 
 /**
- * Verifies that the module is running against the one supported Android user and target process.
+ * Verifies that the module is running against a genuine target process.
+ *
+ * Any Android user is accepted, so app-clone / work-profile instances work. What is enforced instead
+ * is self-consistency: the uid, source dir and process name the framework reported must be
+ * re-confirmed against the target process' own PackageManager when Application.attach runs, which
+ * binds the identity to the user the process actually lives in.
+ *
  * Main-process execution is trusted separately from capture-only Alipay lite processes.
  */
 data class RuntimeIdentity(
@@ -26,15 +32,16 @@ object RuntimeIdentityGuard {
     private data class ModuleSnapshot(
         val uid: Int,
         val sourceDir: String,
+        val userId: Int,
     )
 
     private data class TargetSnapshot(
         val uid: Int,
         val sourceDir: String,
         val processName: String,
+        val userId: Int,
     )
 
-    private const val PRIMARY_ANDROID_USER_ID = 0
     private const val ANDROID_PER_USER_RANGE = 100_000
 
     @Volatile
@@ -49,6 +56,9 @@ object RuntimeIdentityGuard {
     @Volatile
     private var lastDecision = RuntimeIdentityDecision(false, "identity_not_verified")
 
+    @Volatile
+    private var moduleUidDetail: String? = null
+
     @Synchronized
     fun verifyModuleLoaded(applicationInfo: ApplicationInfo): RuntimeIdentityDecision {
         val packageName = applicationInfo.packageName.orEmpty()
@@ -56,10 +66,9 @@ object RuntimeIdentityGuard {
         val userId = androidUserId(applicationInfo.uid)
         val decision = when {
             packageName != General.MODULE_PACKAGE_NAME -> reject("module_package_mismatch")
-            userId != PRIMARY_ANDROID_USER_ID -> reject("module_non_primary_user")
             sourceDir.isBlank() -> reject("module_source_missing")
             else -> {
-                moduleSnapshot = ModuleSnapshot(applicationInfo.uid, sourceDir)
+                moduleSnapshot = ModuleSnapshot(applicationInfo.uid, sourceDir, userId)
                 accept()
             }
         }
@@ -89,11 +98,10 @@ object RuntimeIdentityGuard {
             !isSupportedTargetProcess(targetProcessName) -> reject("target_unsupported_process")
             targetProcessName == General.PACKAGE_NAME && appProcessName != General.PACKAGE_NAME ->
                 reject("target_application_process_mismatch")
-            userId != PRIMARY_ANDROID_USER_ID -> reject("target_non_primary_user")
             sourceDir.isBlank() -> reject("target_source_missing")
-            androidUserId(module.uid) != PRIMARY_ANDROID_USER_ID -> reject("module_non_primary_user")
             else -> {
-                targetSnapshot = TargetSnapshot(applicationInfo.uid, sourceDir, targetProcessName)
+                targetSnapshot =
+                    TargetSnapshot(applicationInfo.uid, sourceDir, targetProcessName, userId)
                 attachedIdentity = null
                 accept()
             }
@@ -120,6 +128,9 @@ object RuntimeIdentityGuard {
             val targetInfo = context.packageManager.getApplicationInfo(General.PACKAGE_NAME, 0)
             metadataStep = "query_module"
             val moduleInfo = context.packageManager.getApplicationInfo(General.MODULE_PACKAGE_NAME, 0)
+            moduleUidDetail =
+                "frameworkModuleUid=${module.uid} frameworkModuleUser=${androidUserId(module.uid)} " +
+                    "pmModuleUid=${moduleInfo.uid} pmModuleUser=${androidUserId(moduleInfo.uid)}"
             metadataStep = "compare_identity"
             when {
                 context.packageName != General.PACKAGE_NAME -> reject("target_context_package_mismatch")
@@ -128,8 +139,7 @@ object RuntimeIdentityGuard {
                 !matchesTargetIdentity(targetInfo, target) -> reject("target_package_manager_mismatch")
                 !matchesTargetSources(contextInfo, targetInfo, target) -> reject("target_source_mismatch")
                 moduleInfo.packageName != General.MODULE_PACKAGE_NAME -> reject("module_package_manager_mismatch")
-                moduleInfo.uid != module.uid -> reject("module_uid_mismatch")
-                androidUserId(moduleInfo.uid) != PRIMARY_ANDROID_USER_ID -> reject("module_non_primary_user")
+                moduleAppId(moduleInfo.uid) != moduleAppId(module.uid) -> reject("module_uid_mismatch")
                 moduleInfo.sourceDir.orEmpty() != module.sourceDir -> reject("module_source_mismatch")
                 else -> {
                     attachedIdentity = RuntimeIdentity(
@@ -172,7 +182,13 @@ object RuntimeIdentityGuard {
 
     fun lastReasonCode(): String? = lastDecision.reasonCode
 
+    /** Uid values compared at the most recent module identity check, for diagnostics. */
+    fun lastModuleUidDetail(): String? = moduleUidDetail
+
     fun trustedIdentity(): RuntimeIdentity? = attachedIdentity
+
+    /** Android user of the verified target process, or null before the target is accepted. */
+    fun targetAndroidUserId(): Int? = targetSnapshot?.userId
 
     private fun isSupportedTargetProcess(processName: String?): Boolean =
         processName == General.PACKAGE_NAME || isCaptureOnlyProcessName(processName)
@@ -189,7 +205,7 @@ object RuntimeIdentityGuard {
     private fun matchesTargetIdentity(info: ApplicationInfo, target: TargetSnapshot): Boolean =
         info.packageName == General.PACKAGE_NAME &&
             info.uid == target.uid &&
-            androidUserId(info.uid) == PRIMARY_ANDROID_USER_ID
+            androidUserId(info.uid) == target.userId
 
     private fun matchesTargetSources(
         contextInfo: ApplicationInfo,
@@ -211,6 +227,16 @@ object RuntimeIdentityGuard {
     /** UserHandle.getUserId is hidden from this module's compile SDK; Android reserves 100000 UIDs per user. */
     private fun androidUserId(uid: Int): Int =
         if (uid >= 0) uid / ANDROID_PER_USER_RANGE else -1
+
+    /**
+     * Application id without the Android user prefix.
+     *
+     * The framework reports the module's canonical uid (e.g. 10580) while a secondary user's
+     * PackageManager reports the user-scoped uid for the same install (e.g. 99910580), so the module
+     * identity check must compare app ids. Comparing raw uids only ever matched in the primary user.
+     */
+    private fun moduleAppId(uid: Int): Int =
+        if (uid >= 0) uid % ANDROID_PER_USER_RANGE else -1
 
     private fun accept(): RuntimeIdentityDecision = RuntimeIdentityDecision(true)
 

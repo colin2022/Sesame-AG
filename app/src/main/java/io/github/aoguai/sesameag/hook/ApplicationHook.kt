@@ -280,6 +280,11 @@ class ApplicationHook {
                     val message = "instance_rejected: $reasonCode process=$processName process_role=main"
                     logFrameworkWarning(message)
                     android.util.Log.w(TAG, message)
+                    RuntimeIdentityGuard.lastModuleUidDetail()?.let { detail ->
+                        val uidDetail = "identity_uid_detail: $detail reason=$reasonCode"
+                        logFrameworkWarning(uidDetail)
+                        android.util.Log.w(TAG, uidDetail)
+                    }
                     return@intercept result
                 }
                 XposedEnv.runtimeIdentity = RuntimeIdentityGuard.trustedIdentity()
@@ -850,6 +855,15 @@ class ApplicationHook {
         private const val FRIEND_CENTER_FIRST_SYNC_DEFER_MS: Long = 30_000L
         private val MIN_SUPPORTED_RPC_VERSION = AlipayVersion("10.3.96.8100")
 
+        /**
+         * The debug HTTP port is device-global, so a primary instance and a clone running in another
+         * Android user would otherwise contend for the same port.
+         */
+        private const val DEBUG_SERVER_BASE_PORT: Int = 8080
+
+        private fun debugServerPort(): Int =
+            DEBUG_SERVER_BASE_PORT + (RuntimeIdentityGuard.targetAndroidUserId() ?: 0).coerceIn(0, 999)
+
         private fun ensureRpcVersionSupported(): Boolean {
             val currentVersion = alipayVersion
             if (currentVersion.versionString.isBlank()) {
@@ -1304,7 +1318,7 @@ class ApplicationHook {
                 // 仅在用户开启“抓包调试模式”时启动调试 HTTP 服务（release 也可用）
                 try {
                     if (debugMode.value == true) {
-                        startIfNeeded(8080, "ET3vB^#td87sQqKaY*eMUJXP", processName, General.PACKAGE_NAME)
+                        startIfNeeded(debugServerPort(), "ET3vB^#td87sQqKaY*eMUJXP", processName, General.PACKAGE_NAME)
                     } else {
                         io.github.aoguai.sesameag.hook.server.ModuleHttpServerManager
                             .stop()
@@ -1488,16 +1502,10 @@ class ApplicationHook {
             record(TAG, "⏳ 正在检查执行权限，暂不启动工作流: $reason")
             execute {
                 try {
-                    val context = appContext ?: return@execute
-                    val executorStatus = CommandUtil.awaitServiceStatus(context)
-                    if (executorStatus is CommandUtil.ServiceStatus.Loading ||
-                        executorStatus is CommandUtil.ServiceStatus.Error
-                    ) {
-                        record(TAG, "⏳ 执行权限服务尚未就绪，保留待初始化状态: $reason")
-                        return@execute
-                    }
+                    // 命令服务只服务于界面探针与诊断读日志，业务任务全部走宿主 RPC。模块进程未启动时
+                    // 绑定服务会被系统拦截，所以这里只读取当前状态用于记录，不再等待或绑定执行器。
+                    val executorStatus = CommandUtil.serviceStatus.value
                     val granted = WorkflowRootGuard.hasRoot(forceRefresh = true, reason = reason) &&
-                        executorStatus is CommandUtil.ServiceStatus.Active &&
                         WorkflowRootGuard.isExecutionAllowed()
                     if (!granted) {
                         Log.w(TAG, "execution_prerequisites_missing: trigger=$reason executor=${executorStatus.javaClass.simpleName} " +
@@ -1506,6 +1514,9 @@ class ApplicationHook {
                         ApplicationHookConstants.clearPendingTriggers("root_denied")
                         AccountSessionCoordinator.refreshWorkflowState(appContext, "root_denied")
                         return@execute
+                    }
+                    if (!WorkflowRootGuard.isExecutorReady()) {
+                        record(TAG, "ℹ️ 命令服务未就绪（${executorStatus.javaClass.simpleName}），以降级模式继续: $reason")
                     }
 
                     ApplicationHookConstants.submitEntry("execution_permission_ready") {
@@ -1544,6 +1555,22 @@ class ApplicationHook {
             val message = "必需权限或使用协议未就绪，已禁止工作流"
             record(TAG, "⛔ $message")
             Log.w(TAG, "execution_prerequisites_missing: legalAccepted=$legalAccepted account=${currentUid?.let(AccountSlotRegistry::shortHash) ?: "unknown"}")
+            // The marker is bound to one module version and lives in one account of one Android
+            // user, so a reinstall, an account switch and "never accepted" all report the same
+            // legalAccepted=false. Print what was actually read to keep them distinguishable.
+            val loadedUser = Config.loadedUserIdRaw()
+            val acceptedVersion = Config.legalAcceptedVersionRaw()?.trim().orEmpty()
+            val configFile =
+                loadedUser?.takeIf { it.isNotBlank() }
+                    ?.let { Files.getConfigV2File(it) }
+                    ?: Files.getDefaultConfigV2File()
+            record(
+                TAG,
+                "legal_gate_detail: androidUser=${RuntimeIdentityGuard.targetAndroidUserId()} " +
+                    "account=${loadedUser?.takeIf { it.isNotBlank() } ?: "<none>"} " +
+                    "file=${configFile.absolutePath} " +
+                    "found=${acceptedVersion.ifEmpty { "<empty>" }} expected=${BuildConfig.VERSION_NAME}",
+            )
             updateRunningStatus(message)
             ApplicationHookConstants.clearPendingTriggers("execution_prerequisites_missing")
             AccountSessionCoordinator.refreshWorkflowState(appContext, "execution_prerequisites_missing", legalAccepted = legalAccepted)
